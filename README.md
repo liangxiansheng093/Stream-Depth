@@ -5,6 +5,7 @@
 - **DINOV2 Encoder**（ViT 主干）
 - **DPT Head**（深度估计）
 - **PoseNet Head**（相邻帧位姿映射）
+- **InterFrameInteractionAttention**（可选帧间记忆交叉注意力）
 
 训练采用混合损失：
 
@@ -60,6 +61,7 @@ python train.py --data-root ./data_root --pretrained-encoder
 ## 4. 核心文件
 
 - `models.py`：DINOV2 encoder + DPT depth head + PoseNet
+- `models.py`：DINOV2 encoder + DPT depth head + PoseNet + 帧间交互注意力模块
 - `dataset.py`：视频帧对数据集读取
 - `losses.py`：重投影、监督、平滑损失
 - `train.py`：完整训练循环与 checkpoint 保存

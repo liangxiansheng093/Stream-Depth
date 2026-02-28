@@ -1,4 +1,5 @@
-from typing import List, Tuple
+from collections import deque
+from typing import Deque, List, Optional, Tuple
 
 import timm
 import torch
@@ -117,15 +118,115 @@ class PoseNetHead(nn.Module):
         return 0.01 * self.fc(x)
 
 
+class InterFrameInteractionAttention(nn.Module):
+    """Cross-attention block that fuses current features with historical memory."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int = 8,
+        memory_size: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if memory_size < 1:
+            raise ValueError("memory_size must be >= 1")
+
+        self.embed_dim = embed_dim
+        self.memory_size = memory_size
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
+        self.norm_out = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        self._memory: Deque[torch.Tensor] = deque(maxlen=memory_size)
+
+    def reset_memory(self) -> None:
+        self._memory.clear()
+
+    def _tokens_from_feature(self, feat: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
+        b, c, h, w = feat.shape
+        if c != self.embed_dim:
+            raise ValueError(f"Expected channel dimension {self.embed_dim}, got {c}")
+        return feat.flatten(2).transpose(1, 2), h, w
+
+    def _build_memory_tokens(
+        self,
+        current_tokens: torch.Tensor,
+        external_memory: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if external_memory is not None:
+            return external_memory
+        if len(self._memory) == 0:
+            return None
+
+        batch = current_tokens.shape[0]
+        if self._memory[0].shape[0] != batch:
+            self.reset_memory()
+            return None
+        return torch.cat(list(self._memory), dim=1)
+
+    def forward(self, current_feat: torch.Tensor, memory_tokens: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            current_feat: [B, C, H, W] current frame features.
+            memory_tokens: Optional external history [B, T, C]. If None, use internal memory queue.
+        """
+        cur_tokens, h, w = self._tokens_from_feature(current_feat)
+        mem_tokens = self._build_memory_tokens(cur_tokens, external_memory=memory_tokens)
+
+        if mem_tokens is None:
+            fused_tokens = cur_tokens
+        else:
+            q = self.norm_q(cur_tokens)
+            kv = self.norm_kv(mem_tokens)
+            attn_tokens, _ = self.attn(q, kv, kv, need_weights=False)
+            fused_tokens = cur_tokens + attn_tokens
+
+        fused_tokens = fused_tokens + self.ffn(self.norm_out(fused_tokens))
+
+        # Store detached history to avoid backprop through long temporal chains.
+        self._memory.append(fused_tokens.detach())
+
+        return fused_tokens.transpose(1, 2).reshape(current_feat.shape[0], self.embed_dim, h, w)
+
+
 class VideoDepthModel(nn.Module):
-    def __init__(self, encoder_name: str, pretrained_encoder: bool = False) -> None:
+    def __init__(
+        self,
+        encoder_name: str,
+        pretrained_encoder: bool = False,
+        enable_temporal_attention: bool = False,
+        temporal_memory_size: int = 4,
+        temporal_num_heads: int = 8,
+    ) -> None:
         super().__init__()
         self.encoder = DINOv2Encoder(encoder_name, pretrained_encoder)
+        self.temporal_attention = (
+            InterFrameInteractionAttention(
+                embed_dim=self.encoder.embed_dim,
+                memory_size=temporal_memory_size,
+                num_heads=temporal_num_heads,
+            )
+            if enable_temporal_attention
+            else None
+        )
         self.depth_head = DPTHead(self.encoder.embed_dim)
         self.pose_head = PoseNetHead()
 
+    def reset_temporal_memory(self) -> None:
+        if self.temporal_attention is not None:
+            self.temporal_attention.reset_memory()
+
     def forward(self, frame_t: torch.Tensor, frame_tp1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         feats_t = self.encoder(frame_t)
+        if self.temporal_attention is not None:
+            feats_t[-1] = self.temporal_attention(feats_t[-1])
         depth_t = self.depth_head(feats_t, out_hw=frame_t.shape[-2:])
         pose_t_to_tp1 = self.pose_head(frame_t, frame_tp1)
         return depth_t, pose_t_to_tp1
